@@ -1,26 +1,46 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+@theme {
+  --color-kokkopi-black: #000407;
+  --color-kokkopi-white: #F5F5F5;
+  --color-kokkopi-red: #FE194E;
+  --color-kokkopi-blue: #198EF8;
+  --color-kokkopi-yellow: #FFBC03;
+  --color-kokkopi-teal: #01695B;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
+@layer base {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --background: #F5F5F5; /* Flat White */
+    --foreground: #000407; /* Long Black */
+  }
+
+  /* Reset body styling to match brand */
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  }
+
+  /* Headings */
+  h1, h2, h3, h4, h5, h6 {
+    font-weight: 800; /* Extra bold */
+    letter-spacing: -0.025em; /* Tight letter spacing for editorial feel */
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/* Custom utilities for strong geometric look */
+@layer utilities {
+  .border-brand {
+    border: 2px solid var(--color-kokkopi-black);
+  }
+  
+  .shadow-brand {
+    box-shadow: 4px 4px 0px 0px var(--color-kokkopi-black);
+  }
+  
+  .shadow-brand-hover {
+    box-shadow: 2px 2px 0px 0px var(--color-kokkopi-black);
+    transform: translate(2px, 2px);
+  }
 }
