@@ -1,0 +1,14 @@
+{
+  "name": "kokkopi-widget",
+  "version": "1.0.0",
+  "description": "Kokkopi embedded widget",
+  "main": "dist/widget.js",
+  "scripts": {
+    "build": "node esbuild.config.js",
+    "watch": "node esbuild.config.js --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.20.0",
+    "typescript": "^5.0.0"
+  }
+}

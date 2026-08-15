@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Customer Website Demo</title>
+    <style>
+        /* Hostile CSS to prove Shadow DOM isolation */
+        * { box-sizing: border-box; }
+        body { font-family: 'Comic Sans MS', cursive; background: #e0f7fa; color: red; }
+        button { all: unset; background: purple !important; padding: 50px; font-size: 40px; }
+    </style>
+</head>
+<body>
+    <h1>Welcome to Sample Dental Clinic</h1>
+    <p>This is a completely normal customer website. There is an ugly button below to prove style bleeding doesn't happen.</p>
+    <button>I am a hostile button</button>
+    
+    <!-- Kokkopi Widget Installation -->
+    <script src="http://127.0.0.1:8000/dist/widget.js" data-agent="agt_demo123"></script>
+    
+    <!-- Normally the script would be hosted by Kokkopi CDN. For local testing we can serve the dist folder using FastAPI StaticFiles or python http.server -->
+</body>
+</html>

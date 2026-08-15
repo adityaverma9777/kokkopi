@@ -1,0 +1,22 @@
+[
+  {
+    "question": "What time do you close on Monday?",
+    "expected_source": "hours"
+  },
+  {
+    "question": "How much does a dental cleaning cost?",
+    "expected_source": "pricing"
+  },
+  {
+    "question": "Do you offer teeth whitening?",
+    "expected_source": "services"
+  },
+  {
+    "question": "What is your cancellation policy?",
+    "expected_source": "policy"
+  },
+  {
+    "question": "Do you perform heart surgery?",
+    "expected_source": "no_answer"
+  }
+]

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Response, HTTPException
 from pydantic import BaseModel
 from backend.voice.service import voice_service
-from backend.api.routers import auth, providers, agents, ingestion
+from backend.api.routers import auth, providers, agents, ingestion, public
 import uvicorn
 import logging
 
@@ -14,6 +14,7 @@ app.include_router(auth.router)
 app.include_router(providers.router)
 app.include_router(agents.router)
 app.include_router(ingestion.router)
+app.include_router(public.router)
 
 class SynthesizeRequest(BaseModel):
     text: str
