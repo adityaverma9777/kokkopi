@@ -1,18 +1,19 @@
-"""Speaker clone extraction and VoiceProfile persistence.
+"""Speaker-clone extraction — diarised segment to per-speaker reference WAV.
 
 Ported from VoiceStudio services/speaker_clone.py.
 
-Picks a clean audio sample from uploaded audio, validates its duration,
-and stores a reusable VoiceProfile tied to the customer's agent/tenant.
+For the Kokkopi voice agent use-case, this module provides two paths:
 
-Authorization/consent is required before any cloning operation. The
-cloning UI must not call this backend without explicit user confirmation.
+1. UPLOAD path (customer provides audio):
+   extract_and_save_reference() — validates + saves a user-uploaded audio clip.
+   Used by the Voice page "Clone a voice" feature.
 
-VoiceProfile lifecycle:
-    1. User uploads a consent-authorized audio sample.
-    2. extract_reference_sample() validates quality and duration.
-    3. VoiceProfile is persisted to DB (tenant-scoped, agent-associated).
-    4. TTS engines use the stored reference WAV for zero-shot cloning.
+2. DIARISED path (programmatic from multi-speaker audio):
+   extract_speaker_clones() — picks the longest clean passage per speaker
+   from diarized segments (used if we ever add speaker diarization ingestion).
+
+Authorization/consent is ALWAYS required before any cloning. The REST
+endpoint enforces this; this module also checks the flag.
 """
 from __future__ import annotations
 
@@ -32,22 +33,179 @@ logger = logging.getLogger("kokkopi.speaker_clone")
 MIN_REF_DURATION_S = 5.0
 MAX_REF_DURATION_S = 30.0
 IDEAL_REF_DURATION_S = 10.0
+MIN_SEGMENT_REF_DURATION_S = 3.0
+MIN_SLICE_DURATION_S = 1.5
+ADJACENT_TURN_GUARD_S = 0.3
 
 VOICE_PROFILES_DIR = Path(os.environ.get("KOKKOPI_VOICE_PROFILES_DIR", "/tmp/kokkopi_voice_profiles"))
 
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="kokkopi_clone")
 
 
-def _validate_and_extract_sync(audio_bytes: bytes) -> dict:
-    """Validate audio quality and extract the usable reference segment.
+def _adjacent_to_other_speaker(seg: dict, speaker_id: str, all_segments: list[dict] | None) -> bool:
+    if not all_segments:
+        return False
+    s0 = float(seg.get("start", 0.0))
+    s1 = float(seg.get("end", 0.0))
+    for other in all_segments:
+        if other is seg:
+            continue
+        if (other.get("speaker_id") or "Speaker 1") == speaker_id:
+            continue
+        o0 = float(other.get("start", 0.0))
+        o1 = float(other.get("end", 0.0))
+        if max(o0 - s1, s0 - o1) < ADJACENT_TURN_GUARD_S:
+            return True
+    return False
 
-    Returns a dict with:
-        - status: "ok" | "too_short" | "too_long" | "silent" | "error"
-        - duration_s: float
-        - sample_rate: int
-        - message: human-readable description
-        - audio_data: np.ndarray (if status=="ok")
+
+def _pick_reference_slices(
+    items: list[tuple[int, dict]],
+    *,
+    speaker_id: str | None = None,
+    all_segments: list[dict] | None = None,
+    labels_source: str | None = None,
+) -> list[tuple[int, dict]]:
+    if not items:
+        return []
+    if labels_source == "heuristic":
+        return []
+    if speaker_id is None:
+        speaker_id = items[0][1].get("speaker_id") or "Speaker 1"
+
+    def _dur(pair) -> float:
+        return max(0.0, float(pair[1].get("end", 0.0)) - float(pair[1].get("start", 0.0)))
+
+    ranked = sorted(
+        items,
+        key=lambda pair: (_adjacent_to_other_speaker(pair[1], speaker_id, all_segments), -_dur(pair)),
+    )
+
+    picked: list[tuple[int, dict]] = []
+    total = 0.0
+    for idx, seg in ranked:
+        dur = _dur((idx, seg))
+        if dur < MIN_SLICE_DURATION_S:
+            continue
+        if total + dur > MAX_REF_DURATION_S and picked:
+            continue
+        picked.append((idx, seg))
+        total += dur
+        if total >= IDEAL_REF_DURATION_S:
+            break
+
+    if total < MIN_REF_DURATION_S:
+        return []
+
+    picked.sort(key=lambda pair: pair[0])
+    return picked
+
+
+def _concat_slices(audio: np.ndarray, sr: int, picked: list[tuple[int, dict]]) -> np.ndarray:
+    parts: list[np.ndarray] = []
+    for _, seg in picked:
+        start = int(float(seg.get("start", 0.0)) * sr)
+        end = int(float(seg.get("end", 0.0)) * sr)
+        start = max(0, start)
+        end = min(audio.size, end)
+        if end <= start:
+            continue
+        parts.append(audio[start:end])
+    if not parts:
+        return np.zeros(0, dtype=np.float32)
+    gap = np.zeros(int(0.02 * sr), dtype=np.float32)
+    out: list[np.ndarray] = []
+    for i, part in enumerate(parts):
+        if i > 0:
+            out.append(gap)
+        out.append(part.astype(np.float32, copy=False))
+    return np.concatenate(out)
+
+
+def _safe_name(speaker_id: str) -> str:
+    cleaned = []
+    for ch in speaker_id.lower():
+        if ch.isalnum():
+            cleaned.append(ch)
+        elif ch in (" ", "-"):
+            cleaned.append("_")
+    return "".join(cleaned) or "speaker"
+
+
+def extract_speaker_clones(
+    vocals_path: str,
+    segments: list[dict],
+    out_dir: str,
+    *,
+    labels_source: str | None = None,
+) -> dict[str, dict]:
+    """Build a per-speaker reference sample from vocals_path + diarized segments.
+
+    Returns dict keyed by speaker_id:
+        {"Speaker 1": {"ref_audio": "/path/voice_speaker_1.wav", "ref_text": "...", "duration": 7.83, "source_count": 2}}
+
+    Speakers with < MIN_REF_DURATION_S are skipped — better to use the
+    default TTS voice than a bad clone.
     """
+    import soundfile as sf
+
+    if labels_source == "heuristic":
+        logger.info("speaker_clone: skipping — speaker labels are gap-based heuristic estimates")
+        return {}
+    if not vocals_path or not os.path.exists(vocals_path):
+        logger.info("speaker_clone: no vocals track at %s; skipping", vocals_path)
+        return {}
+    if not segments:
+        return {}
+
+    try:
+        audio, sr = sf.read(vocals_path, dtype="float32", always_2d=False)
+    except Exception as e:
+        logger.warning("speaker_clone: failed to read %s: %s", vocals_path, e)
+        return {}
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    by_speaker: dict[str, list[tuple[int, dict]]] = {}
+    for idx, seg in enumerate(segments):
+        spk = seg.get("speaker_id") or "Speaker 1"
+        by_speaker.setdefault(spk, []).append((idx, seg))
+
+    os.makedirs(out_dir, exist_ok=True)
+    out: dict[str, dict] = {}
+
+    for speaker_id, items in by_speaker.items():
+        chosen = _pick_reference_slices(items, speaker_id=speaker_id, all_segments=segments, labels_source=labels_source)
+        if not chosen:
+            logger.info("speaker_clone: %s has <%ss of usable audio; falling back to default voice", speaker_id, MIN_REF_DURATION_S)
+            continue
+
+        ref_audio_np = _concat_slices(audio, sr, chosen)
+        if ref_audio_np.size == 0:
+            continue
+
+        safe_id = _safe_name(speaker_id)
+        ref_path = os.path.join(out_dir, f"voice_{safe_id}.wav")
+        try:
+            sf.write(ref_path, ref_audio_np, sr)
+        except Exception as e:
+            logger.warning("speaker_clone: failed to write %s: %s", ref_path, e)
+            continue
+
+        ref_text = " ".join((seg.get("text") or "").strip() for _, seg in chosen).strip()
+        out[speaker_id] = {
+            "ref_audio": ref_path,
+            "ref_text": ref_text,
+            "duration": float(ref_audio_np.size) / float(sr),
+            "source_count": len(chosen),
+        }
+        logger.info("speaker_clone: wrote %s (%.2fs from %d slice(s))", ref_path, out[speaker_id]["duration"], len(chosen))
+
+    return out
+
+
+def _validate_and_extract_sync(audio_bytes: bytes) -> dict:
+    """Validate audio quality and extract a clean reference segment."""
     try:
         import soundfile as sf
     except ImportError:
@@ -67,7 +225,7 @@ def _validate_and_extract_sync(audio_bytes: bytes) -> dict:
                 "status": "too_short",
                 "duration_s": duration_s,
                 "sample_rate": sample_rate,
-                "message": f"Audio is {duration_s:.1f}s. Minimum is {MIN_REF_DURATION_S}s for a reliable voice clone.",
+                "message": f"Audio is {duration_s:.1f}s. Minimum is {MIN_REF_DURATION_S}s for a reliable clone.",
             }
 
         if duration_s > MAX_REF_DURATION_S:
@@ -80,7 +238,7 @@ def _validate_and_extract_sync(audio_bytes: bytes) -> dict:
                 "status": "silent",
                 "duration_s": duration_s,
                 "sample_rate": sample_rate,
-                "message": "The audio appears to be silent. Please upload a recording with clear speech.",
+                "message": "Audio appears silent. Please upload a recording with clear speech.",
             }
 
         if duration_s > IDEAL_REF_DURATION_S:
@@ -101,7 +259,6 @@ def _validate_and_extract_sync(audio_bytes: bytes) -> dict:
 
 
 def _save_reference_wav(audio_data: np.ndarray, sample_rate: int) -> Path:
-    """Save extracted reference audio to disk. Returns the saved path."""
     import soundfile as sf
     VOICE_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     profile_id = str(uuid.uuid4())
@@ -118,24 +275,15 @@ async def extract_and_save_reference(
     profile_name: str,
     consent_confirmed: bool,
 ) -> dict:
-    """Extract a clean voice reference and persist it as a VoiceProfile.
+    """Extract + persist a VoiceProfile from an uploaded audio sample.
 
-    This is the ONLY public entry point for voice cloning. It enforces
-    consent confirmation before any processing begins.
-
-    Returns:
-        {
-            "status": "ok" | "error" | "too_short" | "too_long" | "silent",
-            "profile_id": str (if ok),
-            "wav_path": str (if ok),
-            "duration_s": float,
-            "message": str,
-        }
+    consent_confirmed MUST be True. The cloning UI must not call this without
+    displaying and capturing explicit user consent.
     """
     if not consent_confirmed:
         return {
             "status": "error",
-            "message": "Voice cloning requires explicit consent authorization. Please confirm you own or have permission to use this voice.",
+            "message": "Voice cloning requires explicit consent authorization.",
         }
 
     loop = asyncio.get_event_loop()

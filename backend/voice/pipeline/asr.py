@@ -71,7 +71,6 @@ def _transcribe_sync(audio_bytes: bytes) -> str:
     import io
     model = _get_model()
     audio_file = io.BytesIO(audio_bytes)
-    
     segments, info = model.transcribe(
         audio_file,
         beam_size=5,
@@ -79,14 +78,33 @@ def _transcribe_sync(audio_bytes: bytes) -> str:
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 300},
     )
-    
     texts = []
     for segment in segments:
         texts.append(segment.text.strip())
-    
     transcript = " ".join(texts).strip()
     logger.debug("ASR result: %r (%.2fs, lang=%s)", transcript, info.duration, info.language)
     return transcript
+
+
+def _transcribe_with_language_sync(audio_bytes: bytes) -> tuple[str, str]:
+    """Blocking transcription returning (text, detected_language_code)."""
+    import io
+    model = _get_model()
+    audio_file = io.BytesIO(audio_bytes)
+    segments, info = model.transcribe(
+        audio_file,
+        beam_size=5,
+        language=None,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 300},
+    )
+    texts = []
+    for segment in segments:
+        texts.append(segment.text.strip())
+    transcript = " ".join(texts).strip()
+    detected_lang = info.language or "en"
+    logger.debug("ASR result: %r (lang=%s, prob=%.2f)", transcript, detected_lang, info.language_probability)
+    return transcript, detected_lang
 
 
 async def transcribe(audio_bytes: bytes, timeout: float = ASR_TRANSCRIBE_TIMEOUT_S) -> str:
@@ -116,6 +134,32 @@ async def transcribe(audio_bytes: bytes, timeout: float = ASR_TRANSCRIBE_TIMEOUT
     except asyncio.TimeoutError:
         logger.warning("ASR transcription timed out after %.1fs.", timeout)
         raise TimeoutError(f"Speech transcription timed out after {timeout}s. Try speaking more briefly.")
+    except Exception as e:
+        logger.error("ASR transcription failed: %s", e, exc_info=True)
+        raise
+
+
+async def transcribe_with_language(
+    audio_bytes: bytes,
+    timeout: float = ASR_TRANSCRIBE_TIMEOUT_S,
+) -> tuple[str, str]:
+    """Transcribe audio and return (text, detected_language_code).
+
+    The language code is a 2-letter ISO 639-1 code (e.g. 'en', 'es', 'ja').
+    Use voice.adapters.lang_detect.whisper_lang_to_kokoro() to convert it
+    to a Kokoro lang_code.
+    """
+    if not audio_bytes:
+        return "", "en"
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_executor, _transcribe_with_language_sync, audio_bytes),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("ASR timed out after %.1fs.", timeout)
+        raise TimeoutError(f"Speech transcription timed out after {timeout}s.")
     except Exception as e:
         logger.error("ASR transcription failed: %s", e, exc_info=True)
         raise

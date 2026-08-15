@@ -1,8 +1,3 @@
-"""Voice API routes — gallery, preview, cloning, and pronunciation.
-
-All routes require authentication and are tenant-scoped. The cloning
-endpoints enforce explicit consent before processing any audio.
-"""
 from __future__ import annotations
 
 import logging
@@ -14,9 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.database import get_db
 from auth.dependencies import get_current_tenant
-from voice.pipeline.speaker_clone import extract_and_save_reference, list_builtin_voices
+from voice.pipeline.speaker_clone import extract_and_save_reference
 from voice.pipeline.audio_dsp import list_effect_presets
 from voice.pipeline.asr import is_available as asr_available
+from voice.adapters.kokoro_tts import VOICE_CATALOG, voices_for_language
 
 logger = logging.getLogger("kokkopi.api.voice")
 
@@ -34,12 +30,25 @@ class PronunciationUpdate(BaseModel):
 
 @router.get("/gallery")
 async def get_voice_gallery(
+    language: Optional[str] = None,
+    gender: Optional[str] = None,
     tenant=Depends(get_current_tenant),
 ):
-    """Return the full gallery of built-in voices available for selection."""
+    """Return the full gallery of built-in Kokoro voices.
+
+    Optional filters:
+      - language: filter by lang_code (e.g. 'en-us', 'es-es', 'ja')
+      - gender: filter by 'male' or 'female'
+    """
+    voices = VOICE_CATALOG
+    if language:
+        voices = [v for v in voices if v["lang_code"] == language or v["lang_code"].split("-")[0] == language.split("-")[0]]
+    if gender:
+        voices = [v for v in voices if v.get("gender") == gender]
     return {
-        "voices": list_builtin_voices(),
-        "total": len(list_builtin_voices()),
+        "voices": voices,
+        "total": len(voices),
+        "languages": sorted({v["lang_code"] for v in VOICE_CATALOG}),
     }
 
 
@@ -49,25 +58,30 @@ async def preview_voice(
     text: str = "Hello! I'm here to help you with any questions about this business.",
     tenant=Depends(get_current_tenant),
 ):
-    """Generate a short audio preview for a gallery voice.
-
-    Returns synthesized audio as WAV bytes. This hits the real TTS engine
-    so the user hears exactly what their customers will hear.
-    """
-    voices = {v["id"]: v for v in list_builtin_voices()}
-    if voice_id not in voices:
-        raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found.")
-
-    from voice.service import VoiceService
+    """Generate a short WAV preview for a gallery voice using Kokoro TTS."""
+    from voice.adapters.kokoro_tts import get_voice, synthesize as kokoro_synthesize, _is_kokoro_available
     from fastapi.responses import Response
 
+    voice_meta = get_voice(voice_id)
+    if not voice_meta:
+        raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found.")
+
+    ok, msg = _is_kokoro_available()
+    if not ok:
+        raise HTTPException(status_code=503, detail=f"TTS engine unavailable: {msg}")
+
+    preview_text = voice_meta.get("preview_text") or text
     try:
-        service = VoiceService()
-        audio_bytes = await service.synthesize(text, voice_id=voice_id)
+        audio_bytes = await kokoro_synthesize(preview_text, voice_id, language=voice_meta.get("lang_code", "en-us"))
+        if not audio_bytes:
+            raise HTTPException(status_code=503, detail="TTS synthesis returned empty audio.")
         return Response(content=audio_bytes, media_type="audio/wav")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Preview generation failed for voice %s: %s", voice_id, e)
         raise HTTPException(status_code=503, detail="TTS service unavailable.")
+
 
 
 @router.post("/clone")
